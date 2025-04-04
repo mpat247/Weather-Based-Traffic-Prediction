@@ -18,3 +18,12 @@ xgboost
 lightgbm
 shap
 pyarrow
+ipykernel
+imblearn
+scikit-learn
+xgboost
+imbalanced-learn
+flask
+geopy
+folium
+joblib

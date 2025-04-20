@@ -1,100 +1,154 @@
-from flask import Flask, render_template, request
+#!/usr/bin/env python3
+"""
+app.py – interactive GIS+ML demo
+────────────────────────────────
+• Single‑point traffic prediction
+• Hour‑selectable traffic heat‑map
+• Collision hot‑spots with user‑chosen radius / severity
+"""
+
+from pathlib import Path
+from datetime import datetime, timedelta
+import numpy as np
 import pandas as pd
 import folium
+from folium import plugins
+from flask import Flask, render_template, request
 from geopy.geocoders import Nominatim
 from joblib import load
-import os
 
-app = Flask(__name__)
+# ───── paths & one‑time loads ────────────────────────────────────
+ROOT      = Path(__file__).resolve().parent
+DATA_DIR  = ROOT / "data"
+RAW_DIR   = DATA_DIR / "raw"
+MODEL_DIR = ROOT  / "models"
 
-# Load the saved models
-reg_model = load("tuned_xgb_regressor.joblib")
-clf_model = load("tuned_xgb_classifier.joblib")
+# load our models
+reg_model = load(MODEL_DIR / "xgb_regressor.joblib")
+clf_model = load(MODEL_DIR / "xgb_classifier.joblib")
 
-# Define options for dropdowns
-month_options = ["January", "February", "March", "April", "May", "June", 
-                 "July", "August", "September", "October", "November", "December"]
-days_of_week = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-weather_options = ["Sunny", "Rainy", "Snowy"]
+# load city‑wide table for heat‑map
+df_city = pd.read_csv(
+    DATA_DIR / "combined_final_dataset.csv",
+    parse_dates=["timestamp"], low_memory=False
+)
+df_city["hour"] = df_city["timestamp"].dt.hour
 
-# Mapping for months (for model input)
-month_mapping = {name: idx+1 for idx, name in enumerate(month_options)}
+# raw collisions for hot‑spots
+df_coll = pd.read_csv(
+    DATA_DIR / "Traffic_Collisions_Toronto_data.csv",
+    parse_dates=["OccurrenceDate"], low_memory=False
+).rename(columns={"Latitude":"lat","Longitude":"lon"})
+# ── remove tz so comparisons work ────────────────────────────────
+df_coll["OccurrenceDate"] = df_coll["OccurrenceDate"].dt.tz_convert(None)
 
-# Initialize geocoder (using Nominatim)
-geolocator = Nominatim(user_agent="traffic_app")
+# ───── Flask setup ───────────────────────────────────────────────
+app      = Flask(__name__)
+geocoder = Nominatim(user_agent="traffic_app")
 
-@app.route("/", methods=["GET", "POST"])
+MONTHS  = [
+    "January","February","March","April","May","June",
+    "July","August","September","October","November","December"
+]
+DAYS    = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+WEATHER = ["Sunny","Rainy","Snowy"]
+MONTH2I = {m: i+1 for i, m in enumerate(MONTHS)}
+COLOUR  = {"Low":"green","Medium":"orange","High":"red"}
+
+def build_collision_heat(center, radius_m, fatal_only):
+    cutoff = datetime.utcnow() - timedelta(days=365)
+    sub = df_coll[df_coll["OccurrenceDate"] >= cutoff]
+    if fatal_only:
+        sub = sub[sub["Fatalities"] > 0]
+    lat0, lon0 = center
+    ddeg = radius_m / 1000.0 / 111.0
+    box = sub[
+        sub["lat"].between(lat0-ddeg, lat0+ddeg) &
+        sub["lon"].between(lon0-ddeg, lon0+ddeg)
+    ]
+    return box[["lat","lon"]].dropna().values
+
+@app.route("/", methods=["GET","POST"])
 def index():
     if request.method == "POST":
-        # Get form inputs
-        location_input = request.form.get("location")
-        temperature = request.form.get("temperature")
-        wind_speed = request.form.get("wind_speed")
-        hour = request.form.get("hour")
-        day_of_week = request.form.get("day_of_week")
-        month_str = request.form.get("month")
-        weather = request.form.get("weather")
-        
-        # Convert numeric inputs
-        try:
-            temperature = float(temperature)
-        except:
-            temperature = 0.0
-        try:
-            wind_speed = float(wind_speed)
-        except:
-            wind_speed = 0.0
-        try:
-            hour = int(hour)
-        except:
-            hour = 0
-        month = month_mapping.get(month_str, 0)
-        
-        # Geocode the location (append ", Toronto, ON" for accuracy)
-        loc = geolocator.geocode(f"{location_input}, Toronto, ON")
-        if loc:
-            lat, lon = loc.latitude, loc.longitude
-        else:
-            lat, lon = 43.65, -79.38  # default to downtown Toronto
+        # ── parse inputs ─────────────────────────
+        loc_raw   = request.form["location"]
+        temp_c    = float(request.form["temperature"])
+        wind_sp   = float(request.form["wind_speed"])
+        hour      = int(request.form["hour"])
+        hour_hmap = int(request.form.get("hour_heatmap", hour))
+        dow       = request.form["day_of_week"]
+        month     = MONTH2I[request.form["month"]]
+        weather   = request.form["weather"]
+        hmap_on   = request.form.get("show_heatmap")=="on"
+        rad_m     = int(request.form.get("coll_radius",150))
+        fatal_on  = request.form.get("fatal_only")=="on"
+        kpi_on    = request.form.get("show_collisions")=="on"
 
-        # Format weather summary as "Weather, temp°C"
-        weather_summary = f"{weather}, {temperature:.1f}°C"
-        location_name = location_input  # use the user-entered location
+        # ── geocode & feature row ─────────────────
+        geo = geocoder.geocode(f"{loc_raw}, Toronto, ON")
+        lat, lon = (geo.latitude, geo.longitude) if geo else (43.65, -79.38)
 
-        # Create input DataFrame matching model features
-        input_data = pd.DataFrame({
-            "lat": [lat],
-            "lon": [lon],
-            "temp_c": [temperature],
-            "wind_speed": [wind_speed],
-            "hour": [hour],
-            "day_of_week": [day_of_week],
-            "month": [month],
-            "weather_summary": [weather_summary],
-            "location_name": [location_name]
-        })
+        X = pd.DataFrame([{
+            "lat":lat, "lon":lon,
+            "temp_c":temp_c, "wind_speed":wind_sp,
+            "hour":hour, "day_of_week":dow,
+            "month":month,
+            "weather_summary":f"{weather}, {temp_c:.1f}°C",
+            "location_name":loc_raw,
+            "precip_flag": 0 if weather=="Sunny" else 1
+        }])
 
-        # Make predictions using the loaded models
-        pred_volume = reg_model.predict(input_data)[0]
-        pred_clf_encoded = clf_model.predict(input_data)[0]
-        # (Assuming the LabelEncoder mapping from training: 0:"High", 1:"Low", 2:"Medium")
-        congestion_mapping = {0: "High", 1: "Low", 2: "Medium"}
-        pred_congestion = congestion_mapping.get(pred_clf_encoded, "Unknown")
+        # cyclical features
+        X["hour_sin"]  = np.sin(2*np.pi*X["hour"]/24)
+        X["hour_cos"]  = np.cos(2*np.pi*X["hour"]/24)
+        X["month_sin"] = np.sin(2*np.pi*(X["month"]-1)/12)
+        X["month_cos"] = np.cos(2*np.pi*(X["month"]-1)/12)
 
-        # Create a Folium map centered at the given location
-        m = folium.Map(location=[lat, lon], zoom_start=13)
-        marker_color = {"Low": "green", "Medium": "orange", "High": "red"}.get(pred_congestion, "blue")
-        popup_text = f"<strong>Traffic Volume:</strong> {pred_volume:.2f}<br><strong>Congestion:</strong> {pred_congestion}"
-        folium.Marker([lat, lon], popup=popup_text, icon=folium.Icon(color=marker_color)).add_to(m)
-        map_html = m._repr_html_()
+        # ── predict ───────────────────────────────
+        vol     = float(reg_model.predict(X)[0])
+        cls_enc = int(clf_model.predict(X)[0])
+        cls     = {0:"High",1:"Low",2:"Medium"}.get(cls_enc,"Unknown")
 
-        # Render the results page
-        return render_template("result.html",
-                               pred_volume=pred_volume,
-                               pred_congestion=pred_congestion,
-                               map_html=map_html,
-                               input_data=input_data.to_html(classes="table table-striped", index=False))
-    return render_template("index.html", month_options=month_options, days_of_week=days_of_week, weather_options=weather_options)
+        # ── build map ──────────────────────────────
+        m = folium.Map([lat,lon], zoom_start=13, tiles="cartodbpositron")
+        folium.Marker(
+            [lat,lon],
+            popup=f"<b>Vol:</b> {vol:.0f}<br><b>Cong:</b> {cls}",
+            icon=folium.Icon(color=COLOUR.get(cls,"blue"), icon="car", prefix="fa")
+        ).add_to(m)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+        if hmap_on:
+            pts = df_city[df_city["hour"]==hour_hmap][["lat","lon","total_traffic_volume"]].values
+            plugins.HeatMap(pts, radius=8, blur=12, min_opacity=0.3,
+                            name=f"Heat‑map {hour_hmap:02d}:00").add_to(m)
+
+        if kpi_on:
+            coll_pts = build_collision_heat((lat,lon), rad_m, fatal_on)
+            if len(coll_pts):
+                plugins.HeatMap(
+                    coll_pts, gradient={0.4:"yellow",0.8:"red"},
+                    radius=6, blur=10, min_opacity=0.3,
+                    name=f"Collisions ≤{rad_m}m"
+                ).add_to(m)
+
+        folium.LayerControl().add_to(m)
+
+        return render_template(
+            "result.html",
+            pred_volume=vol,
+            pred_congestion=cls,
+            map_html=m._repr_html_(),
+            input_data=X.to_html(classes="table table-striped table-sm", index=False)
+        )
+
+    # GET form
+    return render_template(
+        "index.html",
+        month_options=MONTHS,
+        days_of_week=DAYS,
+        weather_options=WEATHER
+    )
+
+if __name__=="__main__":
+    app.run(debug=True, threaded=True)

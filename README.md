@@ -118,14 +118,3 @@ Key dependencies:
 - joblib
 
 See `requirements.txt` for full list.
-
-## Model Metrics
-
-From `final_metrics.json`:
-
-| Metric | Evaluation Set | Test Set |
-|--------|---------------|----------|
-| Regression MAE | 52.27 | 52.57 |
-| Regression RMSE | 61.96 | 62.26 |
-| Classification Accuracy | 49.58% | 49.57% |
-| Classification F1 | 0.329 | 0.329 |
